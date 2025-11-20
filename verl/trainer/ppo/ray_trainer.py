@@ -18,11 +18,16 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import os
 import uuid
+import json
+import string
+
+from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from pprint import pprint
-from typing import Type, Dict
+from typing import Type, Dict, List
 
 import re
 import json
@@ -87,6 +92,101 @@ class ResourcePoolManager:
 import torch
 from verl.utils.torch_functional import masked_mean
 
+
+ANSWER_RE = re.compile(r"<answer>\s*(.*?)\s*</answer>", re.IGNORECASE | re.DOTALL)
+
+
+def normalize_answer(s):
+    def remove_articles(text):
+        return re.sub(r"\b(a|an|the)\b", " ", text)
+
+    def white_space_fix(text):
+        return " ".join(text.split())
+
+    def remove_punc(text):
+        exclude = set(string.punctuation)
+        return "".join(ch for ch in text if ch not in exclude)
+
+    def lower(text):
+        return text.lower()
+
+    return white_space_fix(remove_articles(remove_punc(lower(s))))
+
+
+def _calculate_f1(prediction_tokens: List[str], ground_truth_tokens: List[str]) -> float:
+    """Helper function to calculate F1 score between two lists of tokens."""
+    if not prediction_tokens and not ground_truth_tokens:
+        return 1.0
+    if not prediction_tokens or not ground_truth_tokens:
+        return 0.0
+
+    prediction_counter = Counter(prediction_tokens)
+    ground_truth_counter = Counter(ground_truth_tokens)
+    
+    common_tokens = prediction_counter & ground_truth_counter
+    num_common = sum(common_tokens.values())
+
+    if num_common == 0:
+        return 0.0
+
+    precision = num_common / len(prediction_tokens)
+    recall = num_common / len(ground_truth_tokens)
+    
+    f1 = 2 * (precision * recall) / (precision + recall)
+    return f1
+
+def calculate_max_f1(prediction: str, golden_answers: List[str]) -> float:
+    """
+    Calculates the maximum F1 score between a prediction string and a list of golden answers.
+    """
+    if prediction is None:
+        return 0.0
+        
+    normalized_prediction = normalize_answer(prediction)
+    prediction_tokens = normalized_prediction.split()
+    
+    max_f1 = 0.0
+    for golden_answer in golden_answers:
+        normalized_golden = normalize_answer(golden_answer)
+        golden_tokens = normalized_golden.split()
+        
+        current_f1 = _calculate_f1(prediction_tokens, golden_tokens)
+        
+        if current_f1 > max_f1:
+            max_f1 = current_f1
+            
+    return max_f1
+
+
+def extract_information_blocks(text: str) -> list[str]:
+    pattern = r"<information>(.*?)</information>"
+    matches = re.findall(pattern, text, re.DOTALL)
+    return [match.strip() for match in matches]
+
+
+def is_retrieval_correct(text: str, golden_answers: list[str]) -> list[str]:
+    if isinstance(golden_answers, str):
+        golden_answers = [golden_answers]
+    seqs = extract_information_blocks(text)
+    for seq in seqs:
+        for golden_answer in golden_answers:
+            if normalize_answer(golden_answer) in normalize_answer(seq):
+                return True
+    return False
+
+
+def extract_answer(text: str) -> str:
+    """Return the substring inside <answer> ... </answer>; fall back to full text."""
+    m = ANSWER_RE.search(text)
+    return m.group(1).strip() if m else None
+
+
+def save_jsonl(rows, path):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        for row in rows:
+            json.dump(row, f, ensure_ascii=False)
+            f.write("\n")
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty='kl'):
     responses = data.batch['responses']
@@ -410,7 +510,7 @@ class RayPPOTrainer(object):
         self.val_dataloader = DataLoader(dataset=self.val_dataset,
                                          batch_size=self.config.data.val_batch_size,
                                          shuffle=False,
-                                         drop_last=True,
+                                         drop_last=False,
                                          collate_fn=collate_fn)
 
         print(f'Size of train dataloader: {len(self.train_dataloader)}')
@@ -461,7 +561,12 @@ class RayPPOTrainer(object):
             config=gen_config,
             is_validation = True,
         )
-
+        
+        # Use configurable output path, with default to maintain backward compatibility
+        # default_json_path = f"/home/tkdrnjs0621/work/rerank/Search-R1/generation_results_{self.config.actor_rollout_ref.model.path.split('/')[-1].replace('-', '_')}.jsonl"
+        json_path = self.config.trainer.get('output_json_path',"./generation_results.jsonl")#, default_json_path)
+        # Ensure the output directory exists
+        Path(json_path).parent.mkdir(parents=True, exist_ok=True)
         if not self.config.do_search:
             for test_data in self.val_dataloader:
                 test_batch = DataProto.from_single_dict(test_data)
@@ -528,6 +633,40 @@ class RayPPOTrainer(object):
 
                     reward_tensor_lst.append(reward_tensor)
                     data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
+
+                    prompts = self.tokenizer.batch_decode(first_input_ids, skip_special_tokens=False)
+                    responses = self.tokenizer.batch_decode(test_batch.batch["responses"], skip_special_tokens=True)
+                    batch_gt_lst = test_batch.non_tensor_batch["golden_answers"].tolist()
+                    batch_data_source_lst = test_batch.non_tensor_batch["data_source"].tolist()
+
+                    for prompt, response, gt, data_source in zip(prompts, responses, batch_gt_lst, batch_data_source_lst):
+                        answer = extract_answer(response)
+                        correct = False
+                        for golden_answer in gt:
+                            if answer is not None and normalize_answer(golden_answer) == normalize_answer(answer):
+                                correct = True
+                                break
+                        retrieval_correct = is_retrieval_correct(response, gt)
+                            
+                        f1 = calculate_max_f1(answer, gt)
+
+                        with open(json_path, "a", encoding="utf-8") as f:
+                            json.dump(
+                                {
+                                    "data_source": data_source,
+                                    "prompt": prompt.replace(self.tokenizer.eos_token, ""),
+                                    "ground_truth": gt.tolist() if not isinstance(gt, list) else gt,
+                                    "response": response,
+                                    "answer": answer,
+                                    "correct": correct,
+                                    "f1": f1,
+                                    "retrieval_correct": retrieval_correct,
+                                },
+                                f,
+                                ensure_ascii=False,
+                            )
+                            f.write("\n")
+                            f.flush()
 
         reward_tensor = torch.cat([rw.sum(-1) for rw in reward_tensor_lst], dim=0).cpu()  # (batch_size,)
         # reward_tensor = torch.cat(reward_tensor_lst, dim=0).sum(-1).cpu()  # (batch_size,)
